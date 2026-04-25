@@ -1,2 +1,3 @@
 # Official SCPL Library List
 match=https://github.com/a8725425-dotcom/scpl-match.git 
+guard=https://github.com/a8725425-dotcom/scpl-guard.git
