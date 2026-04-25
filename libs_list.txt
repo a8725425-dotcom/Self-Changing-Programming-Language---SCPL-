@@ -5,3 +5,4 @@ json=https://github.com/a8725425-dotcom/scpl-json.git
 http=https://github.com/a8725425-dotcom/scpl-http.git
 path=https://github.com/a8725425-dotcom/scpl-path.git
 test=https://github.com/a8725425-dotcom/scpl-test-.git
+weather=https://github.com/a8725425-dotcom/scpl-weather.git
