@@ -13,3 +13,8 @@ https://raw.githubusercontent.com/a8725425-dotcom/Self-Changing-Programming-Lang
 ```powershell
 powershell -c "iwr -useb https://raw.githubusercontent.com/a8725425-dotcom/Self-Changing-Programming-Language---SCPL-/refs/heads/main/install.ps1 | iex"
 ``` 
+
+Команда для Termux android:
+```bash 
+sh -c "$(curl -fsSL https://raw.githubusercontent.com/.../main/install_for_Termux.sh)"
+```
