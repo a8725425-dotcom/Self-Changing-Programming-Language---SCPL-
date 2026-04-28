@@ -4,10 +4,30 @@ import random
 import json
 import time
 import uuid
+import shutil
+import subprocess
 from pathlib import Path
 from typing import List, Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+
+
+class SCPLString(str):
+    """Строковый литерал в AST, чтобы не путать его с идентификатором."""
+
+
+class TailCall:
+    def __init__(self, name, args):
+        self.name = name
+        self.args = args
+
+
+class SCPLParseError(Exception):
+    def __init__(self, message, line=None, column=None):
+        super().__init__(message)
+        self.message = str(message)
+        self.line = line
+        self.column = column
 
 # ═══════════════════════════════
 # AI-CREATOR
@@ -177,16 +197,104 @@ class SCPLInput:
 class SCPLSound:
     def __init__(self):
         self.volume = 1.0
+        self.current_source = None
+        self.current_mode = None
+        self.backend = self._detect_backend()
+
+    def _detect_backend(self):
+        if shutil.which("termux-media-player"):
+            return "termux-media-player"
+        return "console"
+
+    def _candidate_paths(self, name):
+        raw = Path(str(name)).expanduser()
+        if raw.is_absolute():
+            yield raw
+        else:
+            yield Path.cwd() / raw
+            yield Path(__file__).parent / raw
+            yield Path(__file__).parent / "sounds" / raw
+            yield raw
+
+    def _resolve_source(self, name):
+        if name is None:
+            return None
+
+        value = str(name).strip()
+        if not value:
+            return None
+
+        base_candidates = list(self._candidate_paths(value))
+        extensions = ("", ".mp3", ".wav", ".ogg", ".m4a", ".flac")
+
+        seen = set()
+        for candidate in base_candidates:
+            for ext in extensions:
+                path = candidate if not ext else candidate.with_suffix(ext)
+                normalized = str(path.resolve()) if path.exists() else str(path)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                if path.exists() and path.is_file():
+                    return path
+        return None
+
+    def _run_termux_media_player(self, *args):
+        try:
+            completed = subprocess.run(
+                ["termux-media-player", *args],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode == 0:
+                return True, (completed.stdout or "").strip()
+            message = (completed.stderr or completed.stdout or "").strip()
+            return False, message or "termux-media-player failed"
+        except Exception as exc:
+            return False, str(exc)
     
     def play(self, name):
+        source = self._resolve_source(name)
+        if self.backend == "termux-media-player" and source is not None:
+            ok, message = self._run_termux_media_player("play", str(source))
+            if ok:
+                self.current_source = str(source)
+                self.current_mode = "termux-media-player"
+                return f"Playing {source.name}"
+            return f"Error: {message}"
+
         print(f"[Sound] Playing: {name}")
+        self.current_source = str(name)
+        self.current_mode = "console"
         return f"Playing {name}"
     
-    def stop(self, name):
+    def stop(self, name=None):
+        if self.current_mode == "termux-media-player":
+            ok, message = self._run_termux_media_player("stop")
+            if ok:
+                stopped = self.current_source or name or "sound"
+                self.current_source = None
+                self.current_mode = None
+                return f"Stopped {Path(str(stopped)).name}"
+            print(f"[Sound] Stop error: {message}")
+
         print(f"[Sound] Stopped: {name}")
+        self.current_source = None
+        self.current_mode = None
+        return f"Stopped {name}"
     
     def set_volume(self, vol):
         self.volume = max(0, min(1, vol))
+        return self.volume
+
+    def info(self):
+        return {
+            'backend': self.backend,
+            'volume': self.volume,
+            'current_source': self.current_source,
+            'current_mode': self.current_mode,
+        }
 
 # ═══════════════════════════════
 # PARSER (ПОЛНОСТЬЮ ПЕРЕПИСАН)
@@ -217,10 +325,9 @@ class SCPLParser:
     def _tokenize(self, code: str) -> List:
         """Разбивает код на токены."""
         tokens = []
-        i = 0
         lines = code.split('\n')
         
-        for line in lines:
+        for line_no, line in enumerate(lines, start=1):
             stripped = line.strip()
             if not stripped or stripped.startswith('--'):
                 continue
@@ -249,6 +356,7 @@ class SCPLParser:
                 # Строки
                 if c in '\'"':
                     quote = c
+                    start_col = i + 1
                     i += 1
                     s = ''
                     while i < len(stripped) and stripped[i] != quote:
@@ -256,6 +364,12 @@ class SCPLParser:
                             i += 1
                         s += stripped[i]
                         i += 1
+                    if i >= len(stripped):
+                        raise SCPLParseError(
+                            f"unterminated string starting with {quote}",
+                            line=line_no,
+                            column=start_col,
+                        )
                     i += 1  # Пропускаем закрывающую кавычку
                     tokens.append(f'{quote}{s}{quote}')
                     continue
@@ -307,15 +421,17 @@ class SCPLParser:
                     token = tokens[i]
                     # Распаковка строк
                     if isinstance(token, str) and token.startswith("'") and token.endswith("'"):
-                        parts.append(token[1:-1])
+                        parts.append(SCPLString(token[1:-1]))
                     elif isinstance(token, str) and token.startswith('"') and token.endswith('"'):
-                        parts.append(token[1:-1])
+                        parts.append(SCPLString(token[1:-1]))
                     else:
                         parts.append(token)
                     i += 1
         
         if i < len(tokens) and tokens[i] == ')':
             i += 1
+        else:
+            raise SCPLParseError("unterminated s-expression")
         
         return parts, i
     
@@ -338,9 +454,9 @@ class SCPLParser:
             else:
                 token = tokens[i]
                 if isinstance(token, str) and token.startswith("'") and token.endswith("'"):
-                    args.append(token[1:-1])
+                    args.append(SCPLString(token[1:-1]))
                 elif isinstance(token, str) and token.startswith('"') and token.endswith('"'):
-                    args.append(token[1:-1])
+                    args.append(SCPLString(token[1:-1]))
                 else:
                     args.append(token)
                 i += 1
@@ -355,14 +471,17 @@ class SCPLParser:
 # ═══════════════════════════════
 class SCPLEnvironment:
     def __init__(self):
-        self.vars = {}
+        self.scopes = [{}]
+        self.vars = self.scopes[0]
         self.funcs = {}
+        self.macros = {}
         self.log = []
         self.console_on = False
         self.return_value = None
         self.loop_control = None
         self.modules = {}
         self._if_active = False
+        self._call_stack = []
         
         self.builtins = {
             # Консоль
@@ -416,18 +535,31 @@ class SCPLEnvironment:
             
             # Функции
             'function': self._def_function,
+            'lambda': self._lambda,
+            'macro': self._def_macro,
             'call': self._call_function,
             'return': self._return,
+            'do': self._do,
+            'quote': self._quote,
+            'quasiquote': self._quasiquote,
+            'unquote': self._unquote,
             
             # Списки
             'list': lambda *args: list(args),
             'append': self._append,
             'length': lambda x: len(x) if hasattr(x, '__len__') else 1,
             'nth': lambda lst, n: lst[n] if isinstance(lst, list) and 0 <= n < len(lst) else None,
+            'range': self._range,
             'slice': self._slice,
+            'take': self._take,
+            'drop': self._drop,
             'reverse': self._reverse,
             'contains?': self._contains,
             'sort': self._sort,
+            'map': self._map,
+            'flat-map': self._flat_map,
+            'filter': self._filter,
+            'reduce': self._reduce,
 
             # Словари
             'dict': self._dict,
@@ -502,6 +634,66 @@ class SCPLEnvironment:
             'eval': self._eval,
             'try': self._try_eval,
         }
+
+    def _current_scope(self):
+        return self.scopes[-1]
+
+    def _push_scope(self, initial=None):
+        scope = {}
+        if initial:
+            scope.update(initial)
+        self.scopes.append(scope)
+        return scope
+
+    def _pop_scope(self):
+        if len(self.scopes) > 1:
+            self.scopes.pop()
+
+    def _find_scope(self, name):
+        for scope in reversed(self.scopes):
+            if name in scope:
+                return scope
+        return None
+
+    def _resolve_var(self, name, default=None):
+        scope = self._find_scope(name)
+        if scope is None:
+            return default
+        return scope[name]
+
+    def _visible_vars(self):
+        merged = {}
+        for scope in self.scopes:
+            merged.update(scope)
+        return merged
+
+    def _expr_preview(self, value):
+        if value is None:
+            return 'nil'
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        if isinstance(value, SCPLString):
+            return repr(str(value))
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return '(' + ' '.join(self._expr_preview(item) for item in value) + ')'
+        if self._is_function_value(value):
+            return value.get('name') or '<lambda>'
+        return str(value)
+
+    def _make_function(self, params, body, name=None):
+        param_list = params if isinstance(params, list) else [params]
+        return {
+            '__scpl_function__': True,
+            'name': name,
+            'params': [p for p in param_list if isinstance(p, str)],
+            'body': list(body),
+            'closure_scopes': [scope.copy() for scope in self.scopes],
+        }
+
+    def _is_function_value(self, value):
+        return isinstance(value, dict) and value.get('__scpl_function__') is True
     
     def _add(self, *args):
         return sum(args)
@@ -526,20 +718,50 @@ class SCPLEnvironment:
             return None
         if isinstance(ast, (int, float, bool)):
             return ast
+        if isinstance(ast, SCPLString):
+            return str(ast)
         if isinstance(ast, str):
-            if ast in self.vars:
-                return self.vars[ast]
+            value = self._resolve_var(ast, None)
+            if self._find_scope(ast) is not None:
+                return value
             return ast
         if not isinstance(ast, list) or len(ast) == 0:
             return ast
-        
+        if len(ast) == 1 and isinstance(ast[0], list):
+            return self.exec(ast[0])
+
+        ast = self._expand_macros(ast)
+        if not isinstance(ast, list) or len(ast) == 0:
+            return self.exec(ast)
+        if len(ast) == 1 and isinstance(ast[0], list):
+            return self.exec(ast[0])
+
         fn = ast[0]
 
         # Специальные формы получают часть аргументов как AST, без раннего вычисления.
         if fn in ('import', 'from', 'try'):
             return self.builtins[fn](*ast[1:])
-        if fn in ('function',):
+        if fn == 'set':
+            name = ast[1] if len(ast) > 1 else None
+            value = self.exec(ast[2]) if len(ast) > 2 else None
+            return self.builtins[fn](name, value)
+        if fn in ('get', 'delete', 'var-exists'):
+            name = ast[1] if len(ast) > 1 else None
+            return self.builtins[fn](name)
+        if fn == 'function':
             return self.builtins[fn](ast[1], ast[2], *ast[3:])
+        if fn == 'lambda':
+            return self.builtins[fn](ast[1], *ast[2:])
+        if fn == 'macro':
+            return self.builtins[fn](ast[1], ast[2], *ast[3:])
+        if fn == 'do':
+            return self.builtins[fn](*ast[1:])
+        if fn == 'quote':
+            return self.builtins[fn](ast[1] if len(ast) > 1 else None)
+        if fn == 'quasiquote':
+            return self.builtins[fn](ast[1] if len(ast) > 1 else None)
+        if fn == 'return':
+            return self.builtins[fn](ast[1] if len(ast) > 1 else None)
         if fn in ('if', 'when'):
             condition = self.exec(ast[1]) if len(ast) > 1 else None
             return self.builtins[fn](condition, *ast[2:])
@@ -562,35 +784,194 @@ class SCPLEnvironment:
         for a in ast[1:]:
             if isinstance(a, list):
                 args.append(self.exec(a))
+            elif isinstance(a, SCPLString):
+                args.append(str(a))
             elif isinstance(a, str):
-                if a in self.vars:
-                    args.append(self.vars[a])
+                if self._find_scope(a) is not None:
+                    args.append(self._resolve_var(a))
                 else:
                     args.append(a)
             else:
                 args.append(a)
         
+        head_value = None
+        if isinstance(fn, str) and self._find_scope(fn) is not None:
+            head_value = self._resolve_var(fn)
+
         if fn in self.builtins:
             return self.builtins[fn](*args)
         elif fn in self.funcs:
-            func_body = self.funcs[fn]
-            old_vars = self.vars.copy()
-            if 'params' in func_body:
-                for i, param in enumerate(func_body['params']):
-                    if i < len(args):
-                        self.vars[param] = args[i]
-            result = None
-            for expr in func_body['body']:
-                result = self.exec(expr)
-                if self.return_value is not None:
-                    result = self.return_value
-                    self.return_value = None
-                    break
-            self.vars = old_vars
-            return result
+            return self._invoke_function(fn, args)
+        elif self._is_function_value(head_value):
+            return self._invoke_function_value(head_value, args)
         else:
-            print(f"[SCPL] Unknown: {fn}")
-            return None
+            return self._error(
+                f"unknown function: {fn}",
+                {
+                    'function': fn,
+                    'expression': self._expr_preview(ast),
+                },
+            )
+
+    def _clone_ast(self, node):
+        if isinstance(node, list):
+            return [self._clone_ast(item) for item in node]
+        if isinstance(node, SCPLString):
+            return SCPLString(str(node))
+        return node
+
+    def _expand_macros(self, ast, depth=0):
+        if depth > 100:
+            raise RecursionError("Macro expansion limit exceeded")
+        if not isinstance(ast, list) or not ast:
+            return ast
+
+        fn = ast[0]
+        if fn == 'quote':
+            if len(ast) == 1:
+                return ast
+            return ['quote', self._clone_ast(ast[1])]
+        if fn == 'quasiquote':
+            return ast
+        if isinstance(fn, str) and fn in self.macros:
+            expanded = self._expand_macro_call(fn, ast[1:])
+            return self._expand_macros(expanded, depth + 1)
+
+        return [ast[0]] + [
+            self._expand_macros(item, depth)
+            if isinstance(item, list) else item
+            for item in ast[1:]
+        ]
+
+    def _expand_macro_call(self, name, raw_args):
+        macro = self.macros[name]
+        bindings = {}
+        for index, param in enumerate(macro['params']):
+            bindings[param] = self._clone_ast(raw_args[index]) if index < len(raw_args) else None
+
+        if len(macro['body']) == 1:
+            template = macro['body'][0]
+        else:
+            template = ['do', *macro['body']]
+        return self._expand_macro_template(template, bindings)
+
+    def _expand_macro_template(self, node, bindings):
+        if isinstance(node, list):
+            if not node:
+                return []
+            head = node[0]
+            if head == 'quote':
+                if len(node) == 1:
+                    return ['quote']
+                return ['quote', self._clone_ast(node[1])]
+            if head == 'quasiquote':
+                if len(node) == 1:
+                    return None
+                return self._expand_quasiquote(node[1], bindings)
+            return [self._expand_macro_template(item, bindings) for item in node]
+
+        if isinstance(node, str) and node in bindings:
+            return self._clone_ast(bindings[node])
+        if isinstance(node, SCPLString):
+            return SCPLString(str(node))
+        return node
+
+    def _expand_quasiquote(self, node, bindings):
+        if isinstance(node, list):
+            if node and node[0] == 'unquote':
+                expr = node[1] if len(node) > 1 else None
+                return self._expand_macro_template(expr, bindings)
+            return [self._expand_quasiquote(item, bindings) for item in node]
+        if isinstance(node, SCPLString):
+            return SCPLString(str(node))
+        return node
+
+    def _is_self_tail_call(self, ast):
+        return (
+            isinstance(ast, list)
+            and bool(ast)
+            and bool(self._call_stack)
+            and ast[0] == self._call_stack[-1]
+        )
+
+    def _invoke_function(self, name, args):
+        func_body = self.funcs[name]
+        return self._invoke_function_value(func_body, args, call_name=name)
+
+    def _invoke_callable(self, fn, args):
+        if self._is_function_value(fn):
+            return self._invoke_function_value(fn, args)
+        if isinstance(fn, str) and fn in self.funcs:
+            return self._invoke_function(fn, args)
+        if isinstance(fn, str) and fn in self.builtins:
+            return self.builtins[fn](*args)
+        return self._error(
+            f"value is not callable: {fn}",
+            {
+                'value': fn,
+                'callable': self._expr_preview(fn),
+            },
+        )
+
+    def _invoke_function_value(self, func_body, args, call_name=None):
+        params = func_body.get('params', [])
+        expected = len(params)
+        actual = len(args)
+        function_name = call_name or func_body.get('name') or '<lambda>'
+
+        if actual != expected:
+            return self._error(
+                f"arity mismatch for {function_name}: expected {expected}, got {actual}",
+                {
+                    'function': function_name,
+                    'expected': expected,
+                    'actual': actual,
+                    'args': [self._expr_preview(arg) for arg in args],
+                },
+            )
+        previous_scopes = self.scopes
+        closure_scopes = list(func_body.get('closure_scopes', self.scopes))
+        self._call_stack.append(function_name)
+        next_args = list(args)
+        local_scope = {}
+        self.scopes = closure_scopes + [local_scope]
+
+        try:
+            while True:
+                local_scope.clear()
+                for i, param in enumerate(params):
+                    if i < len(next_args):
+                        local_scope[param] = next_args[i]
+
+                result = None
+                restart = False
+                body = func_body.get('body', [])
+
+                for index, expr in enumerate(body):
+                    is_last = index == len(body) - 1
+                    if is_last and self._is_self_tail_call(expr):
+                        next_args = [self.exec(arg) for arg in expr[1:]]
+                        restart = True
+                        break
+
+                    result = self.exec(expr)
+                    if isinstance(self.return_value, TailCall):
+                        next_args = self.return_value.args
+                        self.return_value = None
+                        restart = True
+                        break
+                    if self.return_value is not None:
+                        result = self.return_value
+                        self.return_value = None
+                        return result
+
+                if restart:
+                    continue
+
+                return result
+        finally:
+            self.scopes = previous_scopes
+            self._call_stack.pop()
     
     # ── Модули ──
     def _load_library(self, name, alias=None):
@@ -606,7 +987,11 @@ class SCPLEnvironment:
 
         init_scpl = lib_path / "__init__.scpl"
         if not init_scpl.exists():
-            return False, f"Library '{name}' has no __init__.scpl"
+            legacy_init = lib_path / "_init_.scpl"
+            if legacy_init.exists():
+                init_scpl = legacy_init
+            else:
+                return False, f"Library '{name}' has no __init__.scpl"
 
         code = init_scpl.read_text(encoding='utf-8')
         parser = SCPLParser()
@@ -716,52 +1101,118 @@ class SCPLEnvironment:
     
     # ── Переменные ──
     def _set(self, name, value):
-        self.vars[name] = value
+        self._current_scope()[name] = value
         return value
     
     def _get(self, name):
-        return self.vars.get(name, f"Error: {name} not found")
+        scope = self._find_scope(name)
+        if scope is None:
+            return f"Error: {name} not found"
+        return scope[name]
     
     def _delete(self, name):
-        if name in self.vars:
-            del self.vars[name]
+        scope = self._find_scope(name)
+        if scope is not None:
+            del scope[name]
     
     def _var_exists(self, name):
-        return name in self.vars
+        return self._find_scope(name) is not None
     
     def _list_vars(self):
-        return list(self.vars.keys())
+        return list(self._visible_vars().keys())
     
     # ── Условия ──
     def _if(self, condition, *body):
+        then_body, else_body = self._split_if_branches(body)
         if condition:
-            result = None
-            for expr in body:
-                result = self.exec(expr)
-                if self.return_value is not None:
-                    return result
-            return result
+            return self._exec_body(then_body)
+        if else_body:
+            return self._exec_body(else_body)
         return None
     
     def _else(self, *args):
         pass  # Обрабатывается в _if
+
+    def _split_if_branches(self, body):
+        then_body = []
+        else_body = []
+        target = then_body
+
+        for expr in body:
+            if isinstance(expr, list) and expr and expr[0] == 'else':
+                target = else_body
+                target.extend(expr[1:])
+                continue
+            target.append(expr)
+
+        return then_body, else_body
+
+    def _exec_body(self, exprs):
+        result = None
+        for expr in exprs:
+            result = self.exec(expr)
+            if self.return_value is not None:
+                return result
+        return result
+
+    def _exec_loop_body(self, exprs):
+        result = None
+        self.loop_control = None
+
+        for expr in exprs:
+            result = self.exec(expr)
+
+            if self.return_value is not None:
+                self.loop_control = None
+                return 'return', result
+
+            if self.loop_control == 'break':
+                self.loop_control = None
+                return 'break', result
+
+            if self.loop_control == 'continue':
+                self.loop_control = None
+                return 'continue', result
+
+        return 'normal', result
     
     # ── Циклы ──
     def _loop(self, count, *body):
+        result = None
         for _ in range(int(count)):
-            for expr in body:
-                self.exec(expr)
+            status, result = self._exec_loop_body(body)
+            if status == 'break':
+                break
+            if status == 'continue':
+                continue
+            if status == 'return':
+                return result
+        return result
     
     def _for(self, var_name, start, end, *body):
+        result = None
         for i in range(int(start), int(end)):
-            self.vars[var_name] = i
-            for expr in body:
-                self.exec(expr)
+            self._current_scope()[var_name] = i
+            status, result = self._exec_loop_body(body)
+            if status == 'break':
+                break
+            if status == 'continue':
+                continue
+            if status == 'return':
+                return result
+        return result
     
     def _while(self, condition, *body):
+        result = None
         while self.exec(condition):
-            for expr in body:
-                self.exec(expr)
+            status, result = self._exec_loop_body(body)
+            if status == 'break':
+                break
+            if status == 'continue':
+                continue
+            if status == 'return':
+                return result
+        return result
     
     def _break(self):
         self.loop_control = 'break'
@@ -772,29 +1223,72 @@ class SCPLEnvironment:
     # ── Функции ──
     def _def_function(self, name, params, *body):
         """Определяет функцию: (function name (p1 p2) body...)"""
-        param_list = params if isinstance(params, list) else [params]
-        self.funcs[name] = {
-            'params': [p for p in param_list if isinstance(p, str)],
-            'body': list(body)
-        }
+        self.funcs[name] = self._make_function(params, body, name=name)
         return f"Function {name} defined"
-    
+
+    def _lambda(self, params, *body):
+        return self._make_function(params, body)
+
+    def _def_macro(self, name, params, *body):
+        param_list = params if isinstance(params, list) else [params]
+        self.macros[name] = {
+            'params': [p for p in param_list if isinstance(p, str)],
+            'body': list(body),
+        }
+        return f"Macro {name} defined"
+
     def _call_function(self, name, *args):
+        if self._is_function_value(name):
+            return self._invoke_function_value(name, args)
         if name in self.funcs:
-            func = self.funcs[name]
-            old_vars = self.vars.copy()
-            for i, param in enumerate(func['params']):
-                if i < len(args):
-                    self.vars[param] = args[i]
-            result = None
-            for expr in func['body']:
-                result = self.exec(expr)
-            self.vars = old_vars
-            return result
-        return f"Function {name} not found"
-    
-    def _return(self, value=None):
+            return self._invoke_function(name, args)
+        return self._error(
+            f"value is not callable: {name}",
+            {
+                'value': name,
+                'callable': self._expr_preview(name),
+            },
+        )
+
+    def _return(self, value_ast=None):
+        if self._is_self_tail_call(value_ast):
+            args = [self.exec(arg) for arg in value_ast[1:]]
+            self.return_value = TailCall(self._call_stack[-1], args)
+            return None
+
+        value = self.exec(value_ast) if isinstance(value_ast, list) else (
+            str(value_ast) if isinstance(value_ast, SCPLString) else value_ast
+        )
+        if isinstance(value_ast, str) and not isinstance(value_ast, SCPLString):
+            value = self._resolve_var(value_ast, value_ast)
         self.return_value = value
+        return value
+
+    def _do(self, *body):
+        result = None
+        for expr in body:
+            result = self.exec(expr)
+            if self.return_value is not None:
+                return result
+        return result
+
+    def _quote(self, value):
+        return self._clone_ast(value)
+
+    def _quasiquote(self, value):
+        return self._runtime_quasiquote(value)
+
+    def _runtime_quasiquote(self, node):
+        if isinstance(node, list):
+            if node and node[0] == 'unquote':
+                expr = node[1] if len(node) > 1 else None
+                return self.exec(expr)
+            return [self._runtime_quasiquote(item) for item in node]
+        if isinstance(node, SCPLString):
+            return str(node)
+        return node
+
+    def _unquote(self, value):
         return value
     
     # ── Списки ──
@@ -803,10 +1297,34 @@ class SCPLEnvironment:
             lst.append(value)
             return lst
 
+    def _range(self, start, end=None, step=1):
+        if end is None:
+            start_value = 0
+            end_value = int(start)
+        else:
+            start_value = int(start)
+            end_value = int(end)
+        step_value = int(step)
+        if step_value == 0:
+            return self._error("range step cannot be zero")
+        return list(range(start_value, end_value, step_value))
+
     def _slice(self, value, start=0, end=None):
         if hasattr(value, '__getitem__'):
             return value[int(start):None if end is None else int(end)]
         return None
+
+    def _take(self, value, count):
+        if not isinstance(value, list):
+            return self._error("take expects a list")
+        amount = max(0, int(count))
+        return value[:amount]
+
+    def _drop(self, value, count):
+        if not isinstance(value, list):
+            return self._error("drop expects a list")
+        amount = max(0, int(count))
+        return value[amount:]
 
     def _reverse(self, value):
         if isinstance(value, list):
@@ -826,6 +1344,59 @@ class SCPLEnvironment:
             except TypeError:
                 return "Error: list contains non-sortable values"
         return "Error: sort expects a list"
+
+    def _map(self, fn, value):
+        if not isinstance(value, list):
+            return self._error("map expects a list")
+        result = []
+        for item in value:
+            mapped = self._invoke_callable(fn, [item])
+            if self._is_error(mapped):
+                return mapped
+            result.append(mapped)
+        return result
+
+    def _flat_map(self, fn, value):
+        if not isinstance(value, list):
+            return self._error("flat-map expects a list")
+        result = []
+        for item in value:
+            mapped = self._invoke_callable(fn, [item])
+            if self._is_error(mapped):
+                return mapped
+            if isinstance(mapped, list):
+                result.extend(mapped)
+            else:
+                result.append(mapped)
+        return result
+
+    def _filter(self, fn, value):
+        if not isinstance(value, list):
+            return self._error("filter expects a list")
+        result = []
+        for item in value:
+            keep = self._invoke_callable(fn, [item])
+            if self._is_error(keep):
+                return keep
+            if keep:
+                result.append(item)
+        return result
+
+    def _reduce(self, fn, value, initial=None):
+        if not isinstance(value, list):
+            return self._error("reduce expects a list")
+        items = list(value)
+        if initial is None:
+            if not items:
+                return self._error("reduce on empty list requires an initial value")
+            acc = items.pop(0)
+        else:
+            acc = initial
+        for item in items:
+            acc = self._invoke_callable(fn, [acc, item])
+            if self._is_error(acc):
+                return acc
+        return acc
 
     def _dict(self, *args):
         if len(args) % 2 != 0:
@@ -979,6 +1550,8 @@ class SCPLEnvironment:
             return 'number'
         if isinstance(value, str):
             return 'string'
+        if self._is_function_value(value):
+            return 'function'
         if isinstance(value, list):
             return 'list'
         if isinstance(value, dict):
@@ -1033,19 +1606,32 @@ class SCPLEnvironment:
     
     # ── Триггеры ──
     def _trigger(self, name, *actions):
-        self.vars[f'trig_{name}'] = True
+        self._current_scope()[f'trig_{name}'] = True
         for action in actions:
             self.exec(action)
     
     def _on_event(self, event, *actions):
-        self.vars[f'event_{event}'] = actions
+        self._current_scope()[f'event_{event}'] = actions
     
     # ── Мета ──
     def _eval(self, code):
         parser = SCPLParser()
-        asts = parser.parse(str(code))
+        if isinstance(code, list):
+            return self.exec(code)
+        try:
+            asts = parser.parse(str(code))
+        except SCPLParseError as exc:
+            return self._error(
+                f"parse error: {exc.message}",
+                {
+                    'line': exc.line,
+                    'column': exc.column,
+                },
+            )
+        result = None
         for a in asts:
-            self.exec(a)
+            result = self.exec(a)
+        return result
 
 # ═══════════════════════════════
 # ENGINE
@@ -1080,6 +1666,7 @@ class SCPLEngine:
         self.env.builtins['Sound-play'] = self.sound.play
         self.env.builtins['Sound-stop'] = self.sound.stop
         self.env.builtins['Sound-volume'] = self.sound.set_volume
+        self.env.builtins['Sound-info'] = self.sound.info
     
     def run_file(self, path):
         p = Path(path)
@@ -1091,9 +1678,19 @@ class SCPLEngine:
         self.run_code(code)
     
     def run_code(self, code):
-        asts = self.parser.parse(code)
+        try:
+            asts = self.parser.parse(code)
+        except SCPLParseError as exc:
+            return self.env._error(
+                f"parse error: {exc.message}",
+                {
+                    'line': exc.line,
+                    'column': exc.column,
+                },
+            )
         for ast in asts:
             self.env.exec(ast)
+        return None
     
     def get_state(self):
         return {
@@ -1102,6 +1699,7 @@ class SCPLEngine:
             'functions': list(self.env.funcs.keys()),
             '3d_objects': self.gl.list_objects(),
             'networks': list(self.ai.networks.keys()),
+            'sound': self.sound.info(),
         }
 
 if __name__ == "__main__":
