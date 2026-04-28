@@ -5,7 +5,8 @@
 
 Команда для Linux:
 ```bash
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/a8725425-dotcom/Self-Changing-Programming-Language---SCPL/main/install.sh)"
+sh -c "$(curl -fsSL 
+https://raw.githubusercontent.com/a8725425-dotcom/Self-Changing-Programming-Language---SCPL-/refs/heads/main/install.sh)"
 ```
 
 Команда для Windows:
