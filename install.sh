@@ -3,7 +3,7 @@
 
 set -e
 
-REPO="a8725425-dotcom/Self-Changing-Programming-Language---SCPL"
+REPO="a8725425-dotcom/Self-Changing-Programming-Language---SCPL-"
 INSTALL_DIR="$HOME/.local/share/scpl"
 BIN_DIR="$HOME/.local/bin"
 SCPL_CMD="$BIN_DIR/scpl"
@@ -15,13 +15,22 @@ mkdir -p "$INSTALL_DIR"
 mkdir -p "$BIN_DIR"
 
 # 2. Скачиваем файлы
-echo "[SCPL] Downloading..."
-curl -L "https://github.com/$REPO/archive/refs/heads/main.tar.gz" | tar xz -C "$INSTALL_DIR" --strip-components=1
+echo "[SCPL] Downloading from GitHub..."
+if ! curl -L "https://github.com/$REPO/archive/refs/heads/main.tar.gz" | tar xz -C "$INSTALL_DIR" --strip-components=1; then
+    echo "[SCPL] Error: Failed to download or extract files"
+    exit 1
+fi
 
 # 3. Делаем cli исполняемым
 chmod +x "$INSTALL_DIR/scpl_cli.py"
 
-# 4. Спрашиваем про PATH
+# 4. Проверяем, есть ли python3
+if ! command -v python3 &> /dev/null; then
+    echo "[SCPL] Error: python3 not found. Please install Python 3 first."
+    exit 1
+fi
+
+# 5. Спрашиваем про PATH
 echo ""
 echo "Добавить CLI в PATH для быстрого доступа (команда 'scpl')?"
 echo "  1) Да (рекомендуется)"
