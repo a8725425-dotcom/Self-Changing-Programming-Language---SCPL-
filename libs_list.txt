@@ -6,3 +6,4 @@ http=https://github.com/a8725425-dotcom/scpl-http.git
 path=https://github.com/a8725425-dotcom/scpl-path.git
 test=https://github.com/a8725425-dotcom/scpl-test-.git
 weather=https://github.com/a8725425-dotcom/scpl-weather.git
+math=https://github.com/a8725425-dotcom/ChatGPT-Trying-to-make-a-library-for-SCPL.git 
